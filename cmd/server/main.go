@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -42,10 +43,33 @@ type ChallengeCache struct {
 	CreatedAt int64  `json:"createdAt"`
 }
 type VerifyRequest struct {
-	ChallengeID string `json:"challengeID"`
+	ChallengeID string `json:"challengeId"`
 	S           string `json:"s"`
 	ClientR     string `json:"clientR"`
 	Username    string `json:"username"`
+}
+
+const pHex1536 = "" +
+	"FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1" +
+	"29024E088A67CC74020BBEA63B139B22514A08798E3404DD" +
+	"EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245" +
+	"E485B576625E7EC6F44C42E9A63A3620FFFFFFFFFFFFFFFF"
+
+const gHex1536 = "2"
+
+func mustGroupParams() (p, q, g *big.Int) {
+	p, err := mustBigFromHex(pHex1536)
+	if err != nil {
+		panic(err)
+	}
+	g, err = mustBigFromHex(gHex1536)
+	if err != nil {
+		panic(err)
+	}
+	one := big.NewInt(1)
+	q = new(big.Int).Sub(p, one)
+	q.Div(q, big.NewInt(2)) // q = (p-1)/2
+	return
 }
 
 func mustBigFromHex(h string) (*big.Int, error) {
@@ -66,6 +90,24 @@ func computeChallengeHex(clientRHex, publicYHex, username string) string {
 func modExp(base, exp, mod *big.Int) *big.Int {
 	return new(big.Int).Exp(base, exp, mod)
 }
+
+// 临时结构体
+type DevProofRequest struct {
+	Username string `json:"username"`
+}
+
+// 临时工具函数生成 [1, q-1] 随机数
+func randInRange(max *big.Int) (*big.Int, error) {
+	// 返回 [1, max-1]
+	n, err := rand.Int(rand.Reader, max)
+	if err != nil {
+		return nil, err
+	}
+	if n.Sign() == 0 {
+		return big.NewInt(1), nil
+	}
+	return n, nil
+}
 func main() {
 	// PostgreSQL
 	dsn := "host=localhost user=postgres password=postgres dbname=zkp_auth port=5432 sslmode=disable TimeZone=Asia/Shanghai"
@@ -84,6 +126,10 @@ func main() {
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		panic(err)
 	}
+
+	p, q, g := mustGroupParams()
+	_ = q
+
 	r := gin.Default()
 
 	r.GET("/ping", func(c *gin.Context) {
@@ -156,19 +202,15 @@ func main() {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to cache challenge"})
 			return
 		}
-		// 先返回固定群参数占位（下一课替换成真实参数）
-		pHex := "ffffffffffffffff" // 占位
-		qHex := "7fffffffffffffff" // 占位
-		gHex := "2"
 
 		//用户不存在也返回正常结构，防用户名枚举
 		_ = userExists
 		c.JSON(http.StatusOK, gin.H{
 			"challengeId": challengeID,
 			"c":           challengeHex,
-			"p":           pHex,
-			"q":           qHex,
-			"g":           gHex,
+			"p":           p.Text(16),
+			"q":           q.Text(16),
+			"g":           g.Text(16),
 		})
 	})
 	r.POST("/api/v1/auth/verify", func(c *gin.Context) {
@@ -211,15 +253,8 @@ func main() {
 			return
 		}
 		// ===== 先用当前占位群参数（下节替换成 RFC 1536-bit）=====
-		pHex := "ffffffffffffffff" // 占位
-		gHex := "2"
-
-		p, err := mustBigFromHex(pHex)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "invalid p"})
-			return
-		}
-		g, _ := mustBigFromHex(gHex)
+		p, q, g := mustGroupParams()
+		_ = q
 		sVal, err := mustBigFromHex(req.S)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid s"})
@@ -257,6 +292,70 @@ func main() {
 			"expiresIn": 86400,
 		})
 	})
+	//dev测试接口
+	r.POST("/dev/proof", func(c *gin.Context) {
+		var req DevProofRequest
+		if err := c.ShouldBindJSON(&req); err != nil || req.Username == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "username required"})
+			return
+		}
+
+		// 1) 生成私钥 x 与公钥 Y
+		x, err := randInRange(q)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "x gen failed"})
+			return
+		}
+		Y := modExp(g, x, p)
+
+		// 2) 注册
+		regBody := RegisterRequest{
+			Username:   req.Username,
+			PublicKeyY: Y.Text(16),
+			Salt:       "dev-salt",
+		}
+		_ = regBody
+		// 如果已存在就忽略
+		var count int64
+		_ = db.Model(&UserCredentials{}).Where("username = ?", req.Username).Count(&count).Error
+		if count == 0 {
+			// create
+		} else {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "username exists in dev, use a new username"})
+			return
+		}
+
+		// 3) 生成 r, R
+		rnd, err := randInRange(q)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "r gen failed"})
+			return
+		}
+		R := modExp(g, rnd, p)
+
+		// 4) 计算 c = H(R||Y||username)
+		cHex := computeChallengeHex(R.Text(16), Y.Text(16), req.Username)
+		cVal, err := mustBigFromHex(cHex)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "c parse failed"})
+			return
+		}
+
+		// 5) s = r + c*x mod q
+		cx := new(big.Int).Mul(cVal, x)
+		s := new(big.Int).Add(rnd, cx)
+		s.Mod(s, q)
+
+		c.JSON(http.StatusOK, gin.H{
+			"username": req.Username,
+			"x":        x.Text(16), // 仅dev演示
+			"publicY":  Y.Text(16),
+			"clientR":  R.Text(16),
+			"c":        cHex,
+			"s":        s.Text(16),
+		})
+	})
+
 	err = r.Run(":8080")
 	if err != nil {
 		return
