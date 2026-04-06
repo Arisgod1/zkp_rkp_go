@@ -9,9 +9,11 @@ import (
 	"errors"
 	"math/big"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"gorm.io/driver/postgres"
@@ -56,6 +58,8 @@ const pHex1536 = "" +
 	"E485B576625E7EC6F44C42E9A63A3620FFFFFFFFFFFFFFFF"
 
 const gHex1536 = "2"
+const jwtSecret = "replace-this-with-env-secret-in-prod"
+const jwtExpireSeconds = 86400
 
 func mustGroupParams() (p, q, g *big.Int) {
 	p, err := mustBigFromHex(pHex1536)
@@ -107,6 +111,53 @@ func randInRange(max *big.Int) (*big.Int, error) {
 		return big.NewInt(1), nil
 	}
 	return n, nil
+}
+func createToken(username string) (string, error) {
+	now := time.Now()
+	claims := jwt.MapClaims{
+		"sub": username,
+		"iat": now.Unix(),
+		"exp": now.Add(time.Second * jwtExpireSeconds).Unix(),
+	}
+	t := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return t.SignedString([]byte(jwtSecret))
+}
+
+func parseToken(tokenStr string) (string, error) {
+	token, err := jwt.Parse(tokenStr, func(token *jwt.Token) (interface{}, error) {
+		return []byte(jwtSecret), nil
+	})
+	if err != nil || !token.Valid {
+		return "", errors.New("invalid token")
+	}
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		return "", errors.New("invalid claims")
+	}
+	sub, ok := claims["sub"].(string)
+	if !ok || sub == "" {
+		return "", errors.New("missing sub")
+	}
+	return sub, nil
+}
+func authMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		auth := c.GetHeader("Authorization")
+		if auth == "" || !strings.HasPrefix(auth, "Bearer ") {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "missing bearer token"})
+			c.Abort()
+			return
+		}
+		tokenStr := strings.TrimPrefix(auth, "Bearer ")
+		username, err := parseToken(tokenStr)
+		if err != nil {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid token"})
+			c.Abort()
+			return
+		}
+		c.Set("username", username)
+		c.Next()
+	}
 }
 func main() {
 	// PostgreSQL
@@ -252,7 +303,7 @@ func main() {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "challenge invalid"})
 			return
 		}
-		// ===== 先用当前占位群参数（下节替换成 RFC 1536-bit）=====
+		// ===== 设置 RFC 1536-bit的群参数=====
 		p, q, g := mustGroupParams()
 		_ = q
 		sVal, err := mustBigFromHex(req.S)
@@ -285,11 +336,15 @@ func main() {
 			return
 		}
 		_ = rdb.Del(ctx, redisKey).Err()
-
+		token, err := createToken(req.Username)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "token create failed"})
+			return
+		}
 		c.JSON(http.StatusOK, gin.H{
-			"token":     "demo-jwt-token-next-step",
+			"token":     token,
 			"type":      "Bearer",
-			"expiresIn": 86400,
+			"expiresIn": jwtExpireSeconds,
 		})
 	})
 	//dev测试接口
@@ -319,7 +374,15 @@ func main() {
 		var count int64
 		_ = db.Model(&UserCredentials{}).Where("username = ?", req.Username).Count(&count).Error
 		if count == 0 {
-			// create
+			user := UserCredentials{
+				Username:   regBody.Username,
+				PublicKeyY: regBody.PublicKeyY,
+				Salt:       regBody.Salt,
+			}
+			if err := db.Create(&user).Error; err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "register in dev failed"})
+				return
+			}
 		} else {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "username exists in dev, use a new username"})
 			return
@@ -355,7 +418,17 @@ func main() {
 			"s":        s.Text(16),
 		})
 	})
-
+	authGroup := r.Group("/api/v1")
+	authGroup.Use(authMiddleware())
+	{
+		authGroup.GET("/me", func(c *gin.Context) {
+			username, _ := c.Get("username")
+			c.JSON(http.StatusOK, gin.H{
+				"username": username,
+				"message":  "authorized",
+			})
+		})
+	}
 	err = r.Run(":8080")
 	if err != nil {
 		return
