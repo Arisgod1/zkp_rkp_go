@@ -7,6 +7,7 @@ import (
 
 	"github.com/Arisgod1/zkp_rkp_go/internal/auth"
 	"github.com/Arisgod1/zkp_rkp_go/internal/controller"
+	"github.com/Arisgod1/zkp_rkp_go/internal/middleware"
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
 	"gorm.io/driver/postgres"
@@ -61,20 +62,26 @@ func main() {
 	userRepo := repository.NewUserRepository(db)
 	authSvc := service.NewAuthService(userRepo, rdb, jwtManager, p, q, g)
 	authCtl := controller.NewAuthController(authSvc)
-
+	userCtl := controller.NewUserController()
 	// 4) 注册路由
 	r := gin.Default()
-	r.GET("/ping", func(c *gin.Context) {
-		c.JSON(200, gin.H{"message": "pong"})
-	})
-
-	auth := r.Group("/api/v1/auth")
+	api := r.Group("/api/v1")
 	{
-		auth.POST("/register", authCtl.Register)
-		auth.POST("/challenge", authCtl.Challenge)
-		auth.POST("/verify", authCtl.Verify)
+		r.GET("/ping", func(c *gin.Context) {
+			c.JSON(200, gin.H{"message": "pong"})
+		})
+		authGroup := api.Group("/auth")
+		{
+			authGroup.POST("/register", authCtl.Register)
+			authGroup.POST("/challenge", authCtl.Challenge)
+			authGroup.POST("/verify", authCtl.Verify)
+		}
+		protected := api.Group("")
+		protected.Use(middleware.AuthMiddleware(jwtManager))
+		{
+			protected.GET("me", userCtl.Me)
+		}
 	}
-
 	// 5) 启动
 	if err := r.Run("localhost:8080"); err != nil {
 		panic(err)
