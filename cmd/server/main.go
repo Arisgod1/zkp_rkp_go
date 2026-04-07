@@ -8,6 +8,7 @@ import (
 	"github.com/Arisgod1/zkp_rkp_go/internal/auth"
 	"github.com/Arisgod1/zkp_rkp_go/internal/controller"
 	"github.com/Arisgod1/zkp_rkp_go/internal/middleware"
+	"github.com/Arisgod1/zkp_rkp_go/pkg/logger"
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
 	"gorm.io/driver/postgres"
@@ -63,8 +64,13 @@ func main() {
 	authSvc := service.NewAuthService(userRepo, rdb, jwtManager, p, q, g)
 	authCtl := controller.NewAuthController(authSvc)
 	userCtl := controller.NewUserController()
-	// 4) 注册路由
-	r := gin.Default()
+	// 4) 初始创建*zap.Logger 实例
+	log := logger.MustNew()
+	// 5) 注册路由
+	r := gin.New()
+	r.Use(gin.Recovery())
+	r.Use(middleware.RequestIDMiddleware())
+	r.Use(middleware.LoggingMiddleware(log))
 	api := r.Group("/api/v1")
 	{
 		r.GET("/ping", func(c *gin.Context) {
