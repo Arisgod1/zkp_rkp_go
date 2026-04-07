@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"math/big"
+	"time"
 
 	"github.com/Arisgod1/zkp_rkp_go/internal/auth"
 	"github.com/Arisgod1/zkp_rkp_go/internal/controller"
 	"github.com/Arisgod1/zkp_rkp_go/internal/middleware"
+	"github.com/Arisgod1/zkp_rkp_go/pkg/config"
 	"github.com/Arisgod1/zkp_rkp_go/pkg/logger"
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
@@ -35,9 +37,11 @@ func mustBigFromHex(h string) *big.Int {
 }
 
 func main() {
+	//导入配置文件
+	cfg := config.MustLoad()
+
 	// 1) 初始化基础设施（DB / Redis）
-	dsn := "host=localhost user=postgres password=postgres dbname=zkp_auth port=5432 sslmode=disable TimeZone=Asia/Shanghai"
-	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	db, err := gorm.Open(postgres.Open(cfg.DB.DSN), &gorm.Config{})
 	if err != nil {
 		panic(err)
 	}
@@ -46,7 +50,7 @@ func main() {
 		panic(err)
 	}
 
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+	rdb := redis.NewClient(&redis.Options{Addr: cfg.Redis.Addr})
 	// 启动前探活
 	if err := rdb.Ping(context.Background()).Err(); err != nil {
 		panic(err)
@@ -59,17 +63,17 @@ func main() {
 	g := big.NewInt(2)
 
 	// 3) 组装依赖（依赖注入）
-	jwtManager := auth.NewJWTManager("replace-this-with-env-secret-in-prod", 86400)
+	jwtManager := auth.NewJWTManager(cfg.JWT.Secret, cfg.JWT.ExpireSeconds)
 	userRepo := repository.NewUserRepository(db)
-	authSvc := service.NewAuthService(userRepo, rdb, jwtManager, p, q, g)
+	challengeTTL := time.Duration(cfg.ZKP.ChallengeTTLSeconds) * time.Second
+	authSvc := service.NewAuthService(userRepo, rdb, jwtManager, p, q, g, challengeTTL)
 	authCtl := controller.NewAuthController(authSvc)
 	userCtl := controller.NewUserController()
-	// 4) 初始创建*zap.Logger 实例
-	log := logger.MustNew()
-	// 5) 注册路由
+	// 4) 注册路由
 	r := gin.New()
 	r.Use(gin.Recovery())
 	r.Use(middleware.RequestIDMiddleware())
+	log := logger.MustNew()
 	r.Use(middleware.LoggingMiddleware(log))
 	api := r.Group("/api/v1")
 	{
@@ -78,9 +82,20 @@ func main() {
 		})
 		authGroup := api.Group("/auth")
 		{
-			authGroup.POST("/register", authCtl.Register)
-			authGroup.POST("/challenge", authCtl.Challenge)
-			authGroup.POST("/verify", authCtl.Verify)
+			ctx := context.Background()
+
+			authGroup.POST("/register",
+				middleware.RateLimitMiddleware(rdb, ctx, "zkp:ratelimit:register", cfg.RateLimit.RegisterPerMinute, time.Minute),
+				authCtl.Register,
+			)
+			authGroup.POST("/challenge",
+				middleware.RateLimitMiddleware(rdb, ctx, "zkp:ratelimit:challenge", cfg.RateLimit.ChallengePerMinute, time.Minute),
+				authCtl.Challenge,
+			)
+			authGroup.POST("/verify",
+				middleware.RateLimitMiddleware(rdb, ctx, "zkp:ratelimit:verify", cfg.RateLimit.VerifyPerMinute, time.Minute),
+				authCtl.Verify,
+			)
 		}
 		protected := api.Group("")
 		protected.Use(middleware.AuthMiddleware(jwtManager))
@@ -89,7 +104,7 @@ func main() {
 		}
 	}
 	// 5) 启动
-	if err := r.Run("localhost:8080"); err != nil {
+	if err := r.Run("localhost:" + cfg.App.Port); err != nil {
 		panic(err)
 	}
 }

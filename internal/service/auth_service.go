@@ -18,12 +18,13 @@ import (
 )
 
 type AuthService struct {
-	repo       *repository.UserRepository
-	rdb        *redis.Client
-	jwtManager *auth.JWTManager
-	p          *big.Int
-	q          *big.Int
-	g          *big.Int
+	repo         *repository.UserRepository
+	rdb          *redis.Client
+	jwtManager   *auth.JWTManager
+	p            *big.Int
+	q            *big.Int
+	g            *big.Int
+	challengeTTL time.Duration
 }
 
 func NewAuthService(
@@ -31,14 +32,16 @@ func NewAuthService(
 	rdb *redis.Client,
 	jwtManager *auth.JWTManager,
 	p, q, g *big.Int,
+	challengeTTL time.Duration,
 ) *AuthService {
 	return &AuthService{
-		repo:       repo,
-		rdb:        rdb,
-		jwtManager: jwtManager,
-		p:          p,
-		q:          q,
-		g:          g,
+		repo:         repo,
+		rdb:          rdb,
+		jwtManager:   jwtManager,
+		p:            p,
+		q:            q,
+		g:            g,
+		challengeTTL: challengeTTL,
 	}
 }
 
@@ -112,7 +115,7 @@ func (s *AuthService) Challenge(ctx context.Context, req model.ChallengeRequest)
 	raw, _ := json.Marshal(cache)
 	key := "zkp:challenge:" + challengeID
 
-	if err := s.rdb.Set(ctx, key, raw, 300*time.Second).Err(); err != nil {
+	if err := s.rdb.Set(ctx, key, raw, s.challengeTTL).Err(); err != nil {
 		return nil, errors.New("failed to cache challenge")
 	}
 
