@@ -6,6 +6,7 @@ import (
 	"math/big"
 	"time"
 
+	"github.com/Arisgod1/zkp_rkp_go/internal/audit"
 	"github.com/Arisgod1/zkp_rkp_go/internal/auth"
 	"github.com/Arisgod1/zkp_rkp_go/internal/controller"
 	"github.com/Arisgod1/zkp_rkp_go/internal/middleware"
@@ -66,8 +67,9 @@ func main() {
 	jwtManager := auth.NewJWTManager(cfg.JWT.Secret, cfg.JWT.ExpireSeconds)
 	userRepo := repository.NewUserRepository(db)
 	challengeTTL := time.Duration(cfg.ZKP.ChallengeTTLSeconds) * time.Second
-	authSvc := service.NewAuthService(userRepo, rdb, jwtManager, p, q, g, challengeTTL)
-	authCtl := controller.NewAuthController(authSvc)
+	auditPublisher := audit.NewNoopPublisher()
+	authService := service.NewAuthService(userRepo, rdb, jwtManager, p, q, g, challengeTTL, auditPublisher)
+	authCtl := controller.NewAuthController(authService)
 	userCtl := controller.NewUserController()
 	// 4) 注册路由
 	r := gin.New()

@@ -9,6 +9,7 @@ import (
 	"math/big"
 	"time"
 
+	"github.com/Arisgod1/zkp_rkp_go/internal/audit"
 	"github.com/Arisgod1/zkp_rkp_go/internal/auth"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
@@ -18,13 +19,14 @@ import (
 )
 
 type AuthService struct {
-	repo         *repository.UserRepository
-	rdb          *redis.Client
-	jwtManager   *auth.JWTManager
-	p            *big.Int
-	q            *big.Int
-	g            *big.Int
-	challengeTTL time.Duration
+	repo           *repository.UserRepository
+	rdb            *redis.Client
+	jwtManager     *auth.JWTManager
+	p              *big.Int
+	q              *big.Int
+	g              *big.Int
+	challengeTTL   time.Duration
+	auditPublisher audit.Publisher
 }
 
 func NewAuthService(
@@ -33,15 +35,20 @@ func NewAuthService(
 	jwtManager *auth.JWTManager,
 	p, q, g *big.Int,
 	challengeTTL time.Duration,
+	auditPublisher audit.Publisher,
 ) *AuthService {
+	if auditPublisher == nil {
+		auditPublisher = audit.NewNoopPublisher()
+	}
 	return &AuthService{
-		repo:         repo,
-		rdb:          rdb,
-		jwtManager:   jwtManager,
-		p:            p,
-		q:            q,
-		g:            g,
-		challengeTTL: challengeTTL,
+		repo:           repo,
+		rdb:            rdb,
+		jwtManager:     jwtManager,
+		p:              p,
+		q:              q,
+		g:              g,
+		challengeTTL:   challengeTTL,
+		auditPublisher: auditPublisher,
 	}
 }
 
@@ -62,39 +69,88 @@ func mustBigFromHex(h string) (*big.Int, error) {
 	return n, nil
 }
 
+func requestIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	v := ctx.Value("requestId")
+	id, _ := v.(string)
+	return id
+}
+
 // ====== 业务方法 ======
 
-func (s *AuthService) Register(ctx context.Context, req model.RegisterRequest) error {
-	_ = ctx // 目前 repo 用 gorm，后续可透传到 db.WithContext(ctx)
+func (s *AuthService) Register(ctx context.Context, req model.RegisterRequest) (retErr error) {
+	reason := ""
+	defer func() {
+		_ = s.auditPublisher.Publish(ctx, audit.Event{
+			EventID:    uuid.NewString(),
+			EventType:  audit.EventRegister,
+			Username:   req.Username,
+			Success:    retErr == nil,
+			Reason:     reason,
+			RequestID:  requestIDFromContext(ctx),
+			OccurredAt: time.Now().UTC(),
+		})
+	}()
 
 	if req.Username == "" || req.PublicKeyY == "" || req.Salt == "" {
-		return errors.New("username/publicKeyY/salt cannot be empty")
+		reason = "invalid_input"
+		retErr = errors.New("username/publicKeyY/salt cannot be empty")
+		return
 	}
 
 	count, err := s.repo.CountByUsername(req.Username)
 	if err != nil {
-		return err
+		reason = "count_error"
+		retErr = err
+		return
 	}
 	if count > 0 {
-		return errors.New("username already exists")
+		reason = "username_exists"
+		retErr = errors.New("username already exists")
+		return
 	}
 
-	return s.repo.Create(&model.UserCredentials{
+	if err := s.repo.Create(&model.UserCredentials{
 		Username:   req.Username,
 		PublicKeyY: req.PublicKeyY,
 		Salt:       req.Salt,
-	})
+	}); err != nil {
+		reason = "db_error"
+		retErr = err
+		return
+	}
+
+	return
 }
 
-func (s *AuthService) Challenge(ctx context.Context, req model.ChallengeRequest) (map[string]any, error) {
+func (s *AuthService) Challenge(ctx context.Context, req model.ChallengeRequest) (retResp map[string]any, retErr error) {
+	reason := ""
+	challengeID := ""
+	defer func() {
+		_ = s.auditPublisher.Publish(ctx, audit.Event{
+			EventID:     uuid.NewString(),
+			EventType:   audit.EventChallenge,
+			Username:    req.Username,
+			Success:     retErr == nil,
+			Reason:      reason,
+			RequestID:   requestIDFromContext(ctx),
+			ChallengeID: challengeID,
+			OccurredAt:  time.Now().UTC(),
+		})
+	}()
+
 	if req.Username == "" || req.ClientR == "" {
-		return nil, errors.New("username/clientR cannot be empty")
+		reason = "invalid_input"
+		retErr = errors.New("username/clientR cannot be empty")
+		return
 	}
 
 	user, err := s.repo.FindByUsername(req.Username)
 	userExists := err == nil
 
-	challengeID := uuid.NewString()
+	challengeID = uuid.NewString()
 	var challengeHex string
 
 	if userExists {
@@ -116,65 +172,102 @@ func (s *AuthService) Challenge(ctx context.Context, req model.ChallengeRequest)
 	key := "zkp:challenge:" + challengeID
 
 	if err := s.rdb.Set(ctx, key, raw, s.challengeTTL).Err(); err != nil {
-		return nil, errors.New("failed to cache challenge")
+		reason = "cache_write_failed"
+		retErr = errors.New("failed to cache challenge")
+		return
 	}
 
-	return map[string]any{
+	retResp = map[string]any{
 		"challengeId": challengeID,
 		"c":           challengeHex,
 		"p":           s.p.Text(16),
 		"q":           s.q.Text(16),
 		"g":           s.g.Text(16),
-	}, nil
+	}
+	return
 }
 
-func (s *AuthService) Verify(ctx context.Context, req model.VerifyRequest) (string, error) {
+func (s *AuthService) Verify(ctx context.Context, req model.VerifyRequest) (retToken string, retErr error) {
+	reason := ""
+	defer func() {
+		_ = s.auditPublisher.Publish(ctx, audit.Event{
+			EventID:     uuid.NewString(),
+			EventType:   audit.EventVerify,
+			Username:    req.Username,
+			Success:     retErr == nil,
+			Reason:      reason,
+			RequestID:   requestIDFromContext(ctx),
+			ChallengeID: req.ChallengeID,
+			OccurredAt:  time.Now().UTC(),
+		})
+	}()
+
 	if req.ChallengeID == "" || req.S == "" || req.ClientR == "" || req.Username == "" {
-		return "", errors.New("challengeId/s/clientR/username cannot be empty")
+		reason = "invalid_input"
+		retErr = errors.New("challengeId/s/clientR/username cannot be empty")
+		return
 	}
 
 	key := "zkp:challenge:" + req.ChallengeID
 	raw, err := s.rdb.Get(ctx, key).Result()
 	if err != nil {
-		return "", errors.New("challenge not found or expired")
+		reason = "challenge_not_found"
+		retErr = errors.New("challenge not found or expired")
+		return
 	}
 	// 验证是否成功都删除 challenge，防重放
 	_ = s.rdb.Del(ctx, key).Err()
 
 	var ch model.ChallengeCache
 	if err := json.Unmarshal([]byte(raw), &ch); err != nil {
-		return "", errors.New("challenge parse failed")
+		reason = "challenge_parse_failed"
+		retErr = errors.New("challenge parse failed")
+		return
 	}
 
 	if ch.Username != req.Username || ch.ClientR != req.ClientR {
-		return "", errors.New("challenge mismatch")
+		reason = "challenge_mismatch"
+		retErr = errors.New("challenge mismatch")
+		return
 	}
 
 	user, err := s.repo.FindByUsername(req.Username)
 	if err != nil {
-		return "", errors.New("invalid credential")
+		reason = "invalid_credential"
+		retErr = errors.New("invalid credential")
+		return
 	}
 
 	recomputed := computeChallengeHex(req.ClientR, user.PublicKeyY, req.Username)
 	if recomputed != ch.Challenge {
-		return "", errors.New("challenge invalid")
+		reason = "challenge_invalid"
+		retErr = errors.New("challenge invalid")
+		return
 	}
 
 	sVal, err := mustBigFromHex(req.S)
 	if err != nil {
-		return "", errors.New("invalid s")
+		reason = "invalid_s"
+		retErr = errors.New("invalid s")
+		return
 	}
 	rVal, err := mustBigFromHex(req.ClientR)
 	if err != nil {
-		return "", errors.New("invalid clientR")
+		reason = "invalid_clientR"
+		retErr = errors.New("invalid clientR")
+		return
 	}
 	yVal, err := mustBigFromHex(user.PublicKeyY)
 	if err != nil {
-		return "", errors.New("invalid publicKeyY")
+		reason = "invalid_publicKeyY"
+		retErr = errors.New("invalid publicKeyY")
+		return
 	}
 	cVal, err := mustBigFromHex(ch.Challenge)
 	if err != nil {
-		return "", errors.New("invalid challenge c")
+		reason = "invalid_challenge_c"
+		retErr = errors.New("invalid challenge c")
+		return
 	}
 
 	left := new(big.Int).Exp(s.g, sVal, s.p)
@@ -183,11 +276,17 @@ func (s *AuthService) Verify(ctx context.Context, req model.VerifyRequest) (stri
 	right.Mod(right, s.p)
 
 	if left.Cmp(right) != 0 {
-		return "", errors.New("zkp verification failed")
+		reason = "invalid_proof"
+		retErr = errors.New("zkp verification failed")
+		return
 	}
 	token, err := s.jwtManager.CreateToken(req.Username)
 	if err != nil {
-		return "", errors.New("token create failed")
+		reason = "token_issue_failed"
+		retErr = errors.New("token create failed")
+		return
 	}
-	return token, nil
+
+	retToken = token
+	return
 }
