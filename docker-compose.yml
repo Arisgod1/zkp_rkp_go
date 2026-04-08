@@ -9,8 +9,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      kafka-init:
-        condition: service_completed_successfully
+      kafka:
+        condition: service_started
     ports:
       - "8080:8080"
     environment:
@@ -82,25 +82,9 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
     volumes:
       - kafka_data:/var/lib/kafka/data
-
-  kafka-init:
-    image: apache/kafka:4.0.0
-    container_name: zkp_kafka_init
-    depends_on:
-      kafka:
-        condition: service_started
-    entrypoint: ["/bin/sh", "-c"]
-    command: >
-      "
-      for i in $(seq 1 30); do
-        /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka:9092 >/dev/null 2>&1 && break;
-        sleep 1;
-      done;
-      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic zkp.audit --partitions 1 --replication-factor 1;
-      "
-    restart: "no"
 
 volumes:
   postgres_data:

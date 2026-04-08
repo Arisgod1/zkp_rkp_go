@@ -16,7 +16,7 @@ zkp:
   challenge_ttl_seconds: 300
 
 rate_limit:
-  register_per_minute: 30
+  register_per_minute: 60
   challenge_per_minute: 60
   verify_per_minute: 60
 
