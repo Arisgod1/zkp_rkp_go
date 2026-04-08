@@ -4,8 +4,17 @@ import (
 	"github.com/spf13/viper"
 )
 
+type KafkaConfig struct {
+	Enabled        bool     `mapstructure:"enabled"`
+	Brokers        []string `mapstructure:"brokers"`
+	Topic          string   `mapstructure:"topic"`
+	ClientID       string   `mapstructure:"client_id"`
+	AsyncQueueSize int      `mapstructure:"async_queue_size"`
+	WriteTimeoutMs int      `mapstructure:"write_timeout_ms"`
+}
 type Config struct {
 	App struct {
+		Host string `mapstructure:"host"`
 		Port string `mapstructure:"port"`
 	} `mapstructure:"app"`
 
@@ -31,6 +40,8 @@ type Config struct {
 		ChallengePerMinute int `mapstructure:"challenge_per_minute"`
 		VerifyPerMinute    int `mapstructure:"verify_per_minute"`
 	} `mapstructure:"rate_limit"`
+
+	Kafka KafkaConfig `mapstructure:"kafka"`
 }
 
 func MustLoad() *Config {

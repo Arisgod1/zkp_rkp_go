@@ -3,7 +3,14 @@ package main
 import (
 	"context"
 	"errors"
+	stdlog "log"
 	"math/big"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Arisgod1/zkp_rkp_go/internal/audit"
@@ -37,6 +44,49 @@ func mustBigFromHex(h string) *big.Int {
 	return n
 }
 
+func buildAuditPublisher(cfg *config.Config) (audit.Publisher, func()) {
+	if !cfg.Kafka.Enabled {
+		return audit.NewNoopPublisher(), func() {}
+	}
+
+	brokers := cfg.Kafka.Brokers
+	topic := strings.TrimSpace(cfg.Kafka.Topic)
+	if len(brokers) == 0 || topic == "" {
+		panic("kafka.enabled=true but kafka.topic is empty")
+	}
+
+	clientID := strings.TrimSpace(cfg.Kafka.ClientID)
+	if clientID == "" {
+		clientID = "zkp_rkp_go"
+	}
+
+	writeTimeout := time.Duration(cfg.Kafka.WriteTimeoutMs) * time.Millisecond
+	if writeTimeout <= 0 {
+		writeTimeout = 800 * time.Millisecond
+	}
+	queueSize := cfg.Kafka.AsyncQueueSize
+	if queueSize <= 0 {
+		queueSize = 1000
+	}
+
+	kafkaPublisher := audit.NewKafkaPublisher(audit.KafkaPublisherConfig{
+		Brokers:      brokers,
+		Topic:        topic,
+		ClientID:     clientID,
+		WriteTimeout: writeTimeout,
+	})
+	asyncPublisher := audit.NewAsyncPublisher(kafkaPublisher, queueSize, writeTimeout)
+
+	closeFn := func() {
+		asyncPublisher.Close()
+		if err := kafkaPublisher.Close(); err != nil {
+			stdlog.Printf("[audit] close kafka writer failed: %v", err)
+		}
+	}
+
+	return asyncPublisher, closeFn
+}
+
 func main() {
 	//导入配置文件
 	cfg := config.MustLoad()
@@ -46,6 +96,15 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		panic(err)
+	}
+	defer func() {
+		if err := sqlDB.Close(); err != nil {
+			stdlog.Printf("[db] close failed: %v", err)
+		}
+	}()
 
 	if err := db.AutoMigrate(&model.UserCredentials{}); err != nil {
 		panic(err)
@@ -56,6 +115,11 @@ func main() {
 	if err := rdb.Ping(context.Background()).Err(); err != nil {
 		panic(err)
 	}
+	defer func() {
+		if err := rdb.Close(); err != nil {
+			stdlog.Printf("[redis] close failed: %v", err)
+		}
+	}()
 
 	// 2) 初始化群参数（一次性）
 	p := mustBigFromHex(pHex1536)
@@ -67,7 +131,8 @@ func main() {
 	jwtManager := auth.NewJWTManager(cfg.JWT.Secret, cfg.JWT.ExpireSeconds)
 	userRepo := repository.NewUserRepository(db)
 	challengeTTL := time.Duration(cfg.ZKP.ChallengeTTLSeconds) * time.Second
-	auditPublisher := audit.NewNoopPublisher()
+	auditPublisher, closeAudit := buildAuditPublisher(cfg)
+	defer closeAudit()
 	authService := service.NewAuthService(userRepo, rdb, jwtManager, p, q, g, challengeTTL, auditPublisher)
 	authCtl := controller.NewAuthController(authService)
 	userCtl := controller.NewUserController()
@@ -106,7 +171,36 @@ func main() {
 		}
 	}
 	// 5) 启动
-	if err := r.Run("localhost:" + cfg.App.Port); err != nil {
+	serverHost := strings.TrimSpace(cfg.App.Host)
+	if serverHost == "" {
+		serverHost = "0.0.0.0"
+	}
+	serverAddr := net.JoinHostPort(serverHost, cfg.App.Port)
+	srv := &http.Server{
+		Addr:    serverAddr,
+		Handler: r,
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- srv.ListenAndServe()
+	}()
+
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	select {
+	case err := <-errCh:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			panic(err)
+		}
+	case <-sigCtx.Done():
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		panic(err)
 	}
 }

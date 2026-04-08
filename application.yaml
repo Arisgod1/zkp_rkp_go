@@ -1,4 +1,5 @@
 app:
+  host: "0.0.0.0"
   port: "8080"
 
 db:
@@ -18,3 +19,12 @@ rate_limit:
   register_per_minute: 30
   challenge_per_minute: 60
   verify_per_minute: 60
+
+kafka:
+  enabled: true
+  brokers:
+    - "localhost:9092"
+  topic: "zkp_audit_events"
+  client_id: "zkp_rkp_go"
+  async_queue_size: 1000
+  write_timeout_ms: 800
