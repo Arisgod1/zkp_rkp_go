@@ -3,10 +3,10 @@ app:
   port: "8080"
 
 db:
-  dsn: "host=localhost user=postgres password=postgres dbname=zkp_auth port=5432 sslmode=disable TimeZone=Asia/Shanghai"
+  dsn: "host=postgres user=zkp_user password=zkp_pass dbname=zkp port=5432 sslmode=disable TimeZone=Asia/Shanghai"
 
 redis:
-  addr: "localhost:6379"
+  addr: "redis:6379"
 
 jwt:
   secret: "replace-this-with-env-secret-in-prod"
@@ -23,8 +23,8 @@ rate_limit:
 kafka:
   enabled: true
   brokers:
-    - "localhost:9092"
-  topic: "zkp_audit_events"
-  client_id: "zkp_rkp_go"
+    - "kafka:9092"
+  topic: "zkp.audit"
+  client_id: "zkp-go"
   async_queue_size: 1000
-  write_timeout_ms: 800
+  write_timeout_ms: 3000
