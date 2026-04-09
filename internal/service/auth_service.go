@@ -29,6 +29,14 @@ type AuthService struct {
 	auditPublisher audit.Publisher
 }
 
+var getAndDeleteChallengeScript = redis.NewScript(`
+local val = redis.call('GET', KEYS[1])
+if val then
+  redis.call('DEL', KEYS[1])
+end
+return val
+`)
+
 func NewAuthService(
 	repo *repository.UserRepository,
 	rdb *redis.Client,
@@ -209,14 +217,19 @@ func (s *AuthService) Verify(ctx context.Context, req model.VerifyRequest) (retT
 	}
 
 	key := "zkp:challenge:" + req.ChallengeID
-	raw, err := s.rdb.Get(ctx, key).Result()
+	rawResult, err := getAndDeleteChallengeScript.Run(ctx, s.rdb, []string{key}).Result()
 	if err != nil {
 		reason = "challenge_not_found"
 		retErr = errors.New("challenge not found or expired")
 		return
 	}
-	// 验证是否成功都删除 challenge，防重放
-	_ = s.rdb.Del(ctx, key).Err()
+
+	raw, ok := rawResult.(string)
+	if !ok || raw == "" {
+		reason = "challenge_not_found"
+		retErr = errors.New("challenge not found or expired")
+		return
+	}
 
 	var ch model.ChallengeCache
 	if err := json.Unmarshal([]byte(raw), &ch); err != nil {
