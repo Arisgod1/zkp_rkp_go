@@ -39,6 +39,8 @@ type Config struct {
 		RegisterPerMinute  int `mapstructure:"register_per_minute"`
 		ChallengePerMinute int `mapstructure:"challenge_per_minute"`
 		VerifyPerMinute    int `mapstructure:"verify_per_minute"`
+		BucketCapacity     int `mapstructure:"bucket_capacity"`
+		BucketRefillPerSec int `mapstructure:"bucket_refill_per_sec"`
 	} `mapstructure:"rate_limit"`
 
 	Kafka KafkaConfig `mapstructure:"kafka"`

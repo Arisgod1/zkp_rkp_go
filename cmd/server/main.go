@@ -87,6 +87,27 @@ func buildAuditPublisher(cfg *config.Config) (audit.Publisher, func()) {
 	return asyncPublisher, closeFn
 }
 
+func resolveBucketConfig(cfg *config.Config, perMinute int) (int, float64) {
+	capacity := cfg.RateLimit.BucketCapacity
+	refillPerSec := float64(cfg.RateLimit.BucketRefillPerSec)
+
+	if refillPerSec <= 0 {
+		refillPerSec = float64(perMinute) / 60.0
+		if refillPerSec < 1 {
+			refillPerSec = 1
+		}
+	}
+
+	if capacity <= 0 {
+		capacity = int(refillPerSec * 10)
+		if capacity < 10 {
+			capacity = 10
+		}
+	}
+
+	return capacity, refillPerSec
+}
+
 func main() {
 	//导入配置文件
 	cfg := config.MustLoad()
@@ -149,18 +170,20 @@ func main() {
 		})
 		authGroup := api.Group("/auth")
 		{
-			ctx := context.Background()
+			registerBucketCap, registerBucketRate := resolveBucketConfig(cfg, cfg.RateLimit.RegisterPerMinute)
+			challengeBucketCap, challengeBucketRate := resolveBucketConfig(cfg, cfg.RateLimit.ChallengePerMinute)
+			verifyBucketCap, verifyBucketRate := resolveBucketConfig(cfg, cfg.RateLimit.VerifyPerMinute)
 
 			authGroup.POST("/register",
-				middleware.RateLimitMiddleware(rdb, ctx, "zkp:ratelimit:register", cfg.RateLimit.RegisterPerMinute, time.Minute),
+				middleware.MultiLayerRateLimitMiddleware(rdb, "zkp:ratelimit:register", registerBucketCap, registerBucketRate, cfg.RateLimit.RegisterPerMinute, time.Minute),
 				authCtl.Register,
 			)
 			authGroup.POST("/challenge",
-				middleware.RateLimitMiddleware(rdb, ctx, "zkp:ratelimit:challenge", cfg.RateLimit.ChallengePerMinute, time.Minute),
+				middleware.MultiLayerRateLimitMiddleware(rdb, "zkp:ratelimit:challenge", challengeBucketCap, challengeBucketRate, cfg.RateLimit.ChallengePerMinute, time.Minute),
 				authCtl.Challenge,
 			)
 			authGroup.POST("/verify",
-				middleware.RateLimitMiddleware(rdb, ctx, "zkp:ratelimit:verify", cfg.RateLimit.VerifyPerMinute, time.Minute),
+				middleware.MultiLayerRateLimitMiddleware(rdb, "zkp:ratelimit:verify", verifyBucketCap, verifyBucketRate, cfg.RateLimit.VerifyPerMinute, time.Minute),
 				authCtl.Verify,
 			)
 		}

@@ -23,7 +23,7 @@
 
 - 零知识认证：基于 Schnorr 协议，服务端只存公钥，不接触私钥。
 - 防重放：Challenge 存 Redis，带 TTL，验证后立即删除。
-- 分布式限流：基于 Redis 的 IP 维度限流（注册/挑战/验证）。
+- 多层限流：令牌桶（平滑突发）+ 滑动窗口（严格总量），均基于 Redis。
 - 异步审计：Kafka 审计事件发布，支持 `Noop -> Kafka + Async` 按配置切换。
 - 优雅退出：服务停止时关闭 HTTP、DB、Redis、审计发布器资源。
 - 一键压测：`zkp_e2e` 提供 `e2e`（真实链路）与 `perf`（轻计算）两种模式。
@@ -149,6 +149,25 @@ docker exec -it zkp_kafka /opt/kafka/bin/kafka-console-consumer.sh \
 	- 响应：`token`, `type`, `expiresIn`
 - `GET /api/v1/me`
 	- Header：`Authorization: Bearer <token>`
+
+---
+
+## 限流策略
+
+每个认证接口都使用两层限流：
+
+- 第一层（Token Bucket）：快速拒绝短时突发，减少后端压力。
+- 第二层（Sliding Window）：控制固定窗口总量，保证分钟级上限。
+
+默认示例（可配置）：
+
+- `bucket_capacity: 50`
+- `bucket_refill_per_sec: 10`
+- `register/challenge/verify_per_minute: 60`
+
+当窗口层拒绝时会执行令牌桶补偿，避免无效扣减导致误伤。
+
+统一错误响应：当命中限流时，HTTP 状态码为 `429`，错误码为 `COMMON_RATE_LIMITED`，并返回统一结构 `code/message/requestId`。
 
 ---
 
